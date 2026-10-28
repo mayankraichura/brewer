@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#12100E">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<title>Brewer</title>
+<style>
+/* Colour tokens and base styles are taken from the Weight Logger page (same look). */
+:root{color-scheme:dark;--bg:#12100E;--card:#1C1916;--raise:#27231E;--line:#3A342D;--tx:#F4EFE8;--mu:#B9AFA3;--ac:#E8955A;--act:#E8955A;--on-ac:#1E1108;--ok:#5CC17D;--warn:#E9B64C;--bad:#F2796A;--warns:#2F2610;--bads:#38191A;--w:#6FB1E0}
+@media (prefers-color-scheme:light){:root{color-scheme:light;--bg:#F4EEE6;--card:#FFFFFF;--raise:#F3ECE2;--line:#DDD2C3;--tx:#231E19;--mu:#5B5248;--act:#A64E12;--ok:#23783D;--warn:#8F5C00;--bad:#B8321F;--warns:#FBF1D9;--bads:#FBE3DE;--w:#1F6FAE}}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+html,body{margin:0}
+body{background:var(--bg);color:var(--tx);font:16px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;-webkit-text-size-adjust:100%}
+button{font:inherit;color:inherit;min-height:48px;padding:0 18px;border-radius:14px;border:1px solid var(--line);background:var(--raise);font-weight:600;cursor:pointer;touch-action:manipulation;white-space:nowrap}
+button.p{background:var(--ac);color:var(--on-ac);border-color:transparent}
+button:disabled{opacity:.45;cursor:not-allowed}
+:focus-visible{outline:3px solid var(--w);outline-offset:2px}
+.num{font-variant-numeric:tabular-nums;font-weight:700;letter-spacing:-.01em;line-height:1}
+.lab{font-size:13px;letter-spacing:.09em;text-transform:uppercase;color:var(--mu);font-weight:700}
+.note{font-size:15px;color:var(--mu)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:20px;padding:16px}
+.dot{width:12px;height:12px;border-radius:50%;border:2px solid var(--mu);flex:none}
+.dot.on{background:var(--ok);border-color:var(--ok)}
+.dot.bad{background:var(--bad);border-color:var(--bad)}
+
+#app{max-width:1100px;margin:0 auto;padding:10px 12px 20px;display:flex;flex-direction:column;gap:12px}
+#top{display:flex;flex-wrap:wrap;align-items:center;gap:8px 10px}
+h1{margin:0;font-size:20px;flex:1 1 auto;display:flex;align-items:center;gap:8px}
+#mode{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--act);border:1px solid var(--act);border-radius:999px;padding:3px 9px}
+#mode:empty{display:none}
+.pill{height:44px;display:flex;align-items:center;gap:9px;padding:0 16px;border-radius:999px;border:1px solid var(--line);background:var(--card);font-size:15px;white-space:nowrap}
+.bat{color:var(--mu);font-size:14px;font-variant-numeric:tabular-nums}
+.bat.low{color:var(--bad);font-weight:700}
+#banner{padding:12px 16px;border-radius:16px;border:1px solid var(--warn);background:var(--warns)}
+#banner.bad{border-color:var(--bad);background:var(--bads)}
+#reads{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}
+@media (min-width:700px){#reads{grid-template-columns:repeat(4,1fr)}}
+.big{font-size:52px}.unit{font-size:18px;color:var(--mu);font-weight:600;margin-left:6px}
+.card .lab{margin-bottom:8px}
+#dev{display:flex;gap:12px;flex-wrap:wrap}
+#dev .card{flex:1 1 220px;display:flex;justify-content:space-between;align-items:center}
+</style>
+</head>
+<body>
+<div id="app">
+ <div id="top">
+  <h1>Brewer <span id="mode"></span></h1>
+  <div class="pill" role="status"><span class="dot" id="dot"></span><span id="stat">Not connected</span></div>
+  <button id="cBrewer" class="p">Connect to Brewer</button>
+  <button id="cScale">Connect to scale</button>
+  <button id="disc" hidden>Disconnect</button>
+ </div>
+ <div id="banner" hidden></div>
+ <div id="dev">
+  <div class="card"><span><span class="lab">Brewer battery</span><br><span class="note" id="bBrewerNote">optional: shown when the Brewer reports it</span></span><span class="bat num" id="bBrewer">&ndash;</span></div>
+  <div class="card"><span><span class="lab">Scale battery</span><br><span class="note" id="bScaleNote">estimate from the cell voltage</span></span><span class="bat num" id="bScale">&ndash;</span></div>
+ </div>
+ <div id="reads">
+  <div class="card"><div class="lab">Temperature</div><span class="num big" id="rT">&ndash;</span><span class="unit">&deg;C</span></div>
+  <div class="card"><div class="lab">Weight</div><span class="num big" id="rW">&ndash;</span><span class="unit">g</span></div>
+  <div class="card"><div class="lab">Brew time</div><span class="num big" id="rE">0:00</span></div>
+  <div class="card"><div class="lab">Pours</div><span class="num big" id="rP">0</span></div>
+ </div>
+ <p class="note">Skeleton. The brew chart, scaled view, reference curve and pour chips move over from the old page in the next steps.</p>
+</div>
+<script src="core.js"></script>
+<script>
+(function(){
+'use strict';
+const $=id=>document.getElementById(id), q=new URLSearchParams(location.search);
+let tr=null;
+
+function banner(msg,bad){const b=$('banner');b.hidden=!msg;b.textContent=msg||'';b.className=bad?'bad':''}
+function setBat(which,pct){
+ const el=$(which==='brewer'?'bBrewer':'bScale');
+ el.textContent=pct==null?'–':'~'+pct+' %';el.classList.toggle('low',pct!=null&&pct<15);
+}
+function fmtT(ms){const s=Math.floor(ms/1000);return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')}
+
+function attach(t){
+ tr=t;
+ t.on('live',l=>{
+  $('rT').textContent=l.temp==null?'–':l.temp.toFixed(1);
+  $('rW').textContent=l.weight==null?'–':l.weight.toFixed(1);
+  $('rE').textContent=fmtT(l.elapsedMs);$('rP').textContent=l.pours;
+  if(l.scaleBat!=null)setBat('scale',l.scaleBat);
+ });
+ t.on('battery',b=>setBat(b.which,b.pct));
+ t.on('status',s=>{
+  $('stat').textContent=s.text;$('dot').className='dot'+(s.connected?' on':'');
+  $('disc').hidden=!s.connected;$('cBrewer').disabled=$('cScale').disabled=s.connected;
+  if(!s.connected&&s.text==='Connection lost')banner('Bluetooth connection lost. Connect again.',true);
+ });
+}
+async function go(t,label){
+ banner('');
+ try{attach(t);await t.connect();$('mode').textContent=label}
+ catch(e){
+  $('stat').textContent='Not connected';
+  // a cancelled device chooser is not an error worth a banner
+  if(!(e&&e.name==='NotFoundError'))banner('Could not connect: '+(e&&e.message||e),true);
+ }
+}
+const hasBT=typeof navigator!=='undefined'&&!!navigator.bluetooth;
+function needBT(){if(!hasBT){banner('This browser has no Web Bluetooth. Use Chrome or Edge, or Bluefy on iOS.',true);return false}return true}
+$('cBrewer').onclick=()=>{if(needBT())go(new BU.BleBrewerTransport(navigator.bluetooth),'Brewer (draft)')};
+$('cScale').onclick=()=>{if(needBT())go(new BU.BleScaleTransport(navigator.bluetooth),'Scale only')};
+$('disc').onclick=()=>{if(tr)tr.disconnect()};
+
+if(q.has('demo')){go(new BU.DemoTransport(),'Demo')}
+else if(q.has('ws')&&location.protocol==='http:'){go(new BU.WsTransport('ws://'+q.get('ws')+'/ws'),'Wi-Fi')}
+else if(!hasBT)banner('This browser has no Web Bluetooth. Use Chrome or Edge, or Bluefy on iOS. Add ?demo to the address to see simulated data.');
+
+if('serviceWorker' in navigator&&location.protocol!=='file:')navigator.serviceWorker.register('sw.js').catch(()=>{});
+})();
+</script>
+</body>
+</html>
