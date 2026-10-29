@@ -97,20 +97,25 @@
   // ---- Transport 1: demo (no hardware) ----
   // A 3 minute pour-over: bloom at 0 s, pours of 50 g at 45, 65, 85, 105 s. `timer` can be replaced in tests.
   class DemoTransport extends Emitter {
-    constructor(opt) { super(); this.kind = 'demo'; this.opt = opt || {}; this.t = 0; this.timer = null; this.running = false; this.pending = false; }
+    constructor(opt) { super(); this.kind = 'demo'; this.opt = opt || {}; this.t = 0; this.timer = null; this.st = 0; }
+    get running() { return this.st === 1; }
     async connect() {
       this.emit('status', { connected: true, text: 'Demo' });
       this.emit('battery', { which: 'brewer', pct: 87 }); this.emit('battery', { which: 'scale', pct: 64 });
       if (!this.opt.manual) this.timer = setInterval(() => this.step(0.1), 100);
     }
     disconnect() { clearInterval(this.timer); this.timer = null; this.emit('status', { connected: false, text: 'Not connected' }); }
+    // state as the Brewer has it: 0 idle, 1 running, 2 paused (a finished brew stays on the chart until `Brew end`)
     async send(cmd) {
-      if (/^Brew start/i.test(cmd)) { this.running = true; this.t = 0; }
-      else if (/^Brew (stop|end)/i.test(cmd)) this.running = false;
+      let m;
+      if (/^Brew start/i.test(cmd)) { this.st = 1; this.t = 0; }
+      else if (/^Brew (stop|pause)/i.test(cmd)) { if (this.st === 1) this.st = 2; }
+      else if (/^Brew end/i.test(cmd)) { this.st = 0; this.t = 0; }
+      else if ((m = /^BrewKettle ([\d.]+)/i.exec(cmd))) { this.st = 2; this.emit('kettle', { c: parseFloat(m[1]) }); }
       this.emit('reply', { id: null, text: JSON.stringify({ ack: 1, cmd }) });
     }
     step(dt) {
-      if (this.running) this.t += dt;
+      if (this.st === 1) this.t += dt;
       const t = this.t, poured = t > 0 ? [0, 45, 65, 85, 105].filter(x => t >= x).length : 0;
       const pourAt = [[0, 12], [45, 55], [65, 75], [85, 95], [105, 113]];
       let w = 0;
@@ -118,8 +123,8 @@
       const open = pourAt.some(([a, b]) => t >= a && t < b);
       const temp = 30 + 56 * (1 - Math.exp(-t / 12)) * (t > 0 ? 1 : 0.1) - Math.max(0, t - 120) * 0.15;
       this.emit('live', {
-        temp: this.running || t > 0 ? temp : 24.5, cj: 24.1, weight: w, state: this.running ? 1 : 0,
-        elapsedMs: Math.round(t * 1000), pours: poured, auto: true, pourOpen: open && this.running, weightMode: true,
+        temp: this.st || t > 0 ? temp : 24.5, cj: 24.1, weight: w, state: this.st,
+        elapsedMs: Math.round(t * 1000), pours: poured, auto: true, pourOpen: open && this.st === 1, weightMode: true,
         scaleConnected: true, sim: true, fault: 0, scaleBat: 64, rssi: null,
       });
     }
@@ -263,9 +268,9 @@
         const t = l.elapsedMs / 1000, open = this.pours.length && this.pours[this.pours.length - 1][1] == null;
         if (l.pourOpen && !open) this.pours.push([t, null]);
         else if (!l.pourOpen && open) this.pours[this.pours.length - 1][1] = t;
-        if (this.brew.length < this.maxBrew) this.brew.push([t, l.temp, l.weight]);
+        if (this.brew.length < this.maxBrew) this.brew.push([t, l.temp, BrewTrace.okWeight(l.weight)]);
       } else {
-        this.live.push([nowS, l.temp, l.weight]);
+        this.live.push([nowS, l.temp, BrewTrace.okWeight(l.weight)]);
         while (this.live.length && nowS - this.live[0][0] > this.liveWin) this.live.shift();
       }
       this.state = l.state;
@@ -275,11 +280,13 @@
       const brewView = this.state !== 0;
       if (brewView) {
         const el = this.last ? this.last.elapsedMs / 1000 : 0;
-        const pours = this.pours.map(p => [p[0], p[1] == null ? el : p[1]]);
+        const pours = this.pours.map(p => [p[0], p[1] == null ? el : p[1], p[1] == null]);
         return { brewView, pts: this.brew, x0: 0, x1: Math.max(210, el + 20), wtop: BrewTrace.weightTop(this.brew), pours };
       }
       return { brewView, pts: this.live, x0: this.clock - this.liveWin, x1: this.clock, wtop: 0, pours: [] };
     }
+    // A weight below -5 g means the scale was lifted or the dripper was moved (b11.csv: -140 g for 2.6 s): a gap, not a value.
+    static okWeight(w) { return w == null || w < -5 ? null : w; }
     // Weight axis top: at least 300 g, rounded up to 50 g; 0 when the brew has no weights.
     static weightTop(pts) {
       let m = -1e9, has = false;
@@ -288,7 +295,144 @@
     }
   }
 
+  // ---- C2 brew CSV: time_s,temp_c,event,weight_g ----
+  // Sample rows have an empty event field (index k = k*0.1 s); event rows carry their OWN time, which is earlier than the
+  // row before them (the Brewer writes an event when it detects it), so the file order is not the time order.
+  // Identical event rows (the kettle row twice in b11.csv) are counted once.
+  function parseBrewCsv(text) {
+    const samples = [], events = [], seen = new Set(); let dupes = 0;
+    for (const ln of String(text).replace(/^﻿/, '').split(/\r?\n/)) {
+      const f = ln.trim().split(',');
+      const t = parseFloat(f[0]);
+      if (!isFinite(t)) continue;   // header, blank line
+      const ev = (f[2] || '').trim();
+      if (ev) {
+        const key = t + '|' + ev;
+        if (seen.has(key)) { dupes++; continue; }
+        seen.add(key); events.push({ t, name: ev });
+      } else {
+        const T = parseFloat(f[1]), W = parseFloat(f[3]);
+        samples.push([t, isFinite(T) ? T : null, isFinite(W) ? W : null]);
+      }
+    }
+    events.sort((a, b) => a.t - b.t);
+    const last = samples.length ? samples[samples.length - 1][0] : 0;
+    const endEv = events.find(e => e.name === 'end');
+    const duration = endEv ? endEv.t : last;
+    // pours: bloom = pour 1; "pour N [auto]" opens pour N; "stop N" closes it; a pour left open ends at the next start
+    const open = {}, list = [];
+    for (const e of events) {
+      let m;
+      if (e.name === 'bloom') { const p = { n: 1, start: e.t, end: null }; open[1] = p; list.push(p); }
+      else if ((m = /^pour (\d+)/.exec(e.name))) { const p = { n: +m[1], start: e.t, end: null }; open[p.n] = p; list.push(p); }
+      else if ((m = /^stop (\d+)/.exec(e.name)) && open[+m[1]]) { open[+m[1]].end = e.t; }
+    }
+    list.sort((a, b) => a.start - b.start);
+    list.forEach((p, i) => { if (p.end == null) p.end = i + 1 < list.length ? list[i + 1].start : duration; });
+    const kEv = events.filter(e => /^kettle /.test(e.name)).pop();
+    return {
+      samples, events, dupes, duration, pours: list.map(p => [p.start, p.end]),
+      kettle: kEv ? parseFloat(kEv.name.slice(7)) : null, hasWeight: samples.some(p => p[2] != null),
+    };
+  }
+
+  // value of column `col` (1 temp, 2 weight) at time t: the nearest sample (binary search on sorted points)
+  function valueAt(pts, t, col) {
+    let lo = 0, hi = pts.length - 1;
+    if (hi < 0) return null;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (pts[mid][0] < t) lo = mid + 1; else hi = mid; }
+    if (lo > 0 && Math.abs(pts[lo - 1][0] - t) < Math.abs(pts[lo][0] - t)) lo--;
+    return pts[lo][col];
+  }
+  // A CLOSED pour that added less than this is not a pour (b11.csv: pour 6 added 8.7 g, the user poured 5 times). A pour that is
+  // still open is never small. This is a page-side rule until the Brewer stops reporting such pours itself.
+  const MIN_POUR_G = 15;
+  // chips under the chart: number, start, duration, grams (weight at the end minus weight at the start); span = [start, end, open?]
+  function pourChips(spans, pts) {
+    return spans.map((p, i) => {
+      const a = valueAt(pts, p[0], 2), b = valueAt(pts, p[1], 2), g = a == null || b == null ? null : b - a;
+      return { i, label: i ? String(i + 1) : 'B', start: p[0], end: p[1], dur: p[1] - p[0], g, small: i > 0 && !p[2] && g != null && g < MIN_POUR_G };
+    });
+  }
+  // only the real pours, numbered again in order (B, 2, 3 ...); `ignored` = how many were dropped
+  function realChips(spans, pts) {
+    const all = pourChips(spans, pts), real = all.filter(c => !c.small);
+    real.forEach((c, k) => { c.label = k ? String(k + 1) : 'B'; c.i = k; });
+    return { chips: real, ignored: all.length - real.length };
+  }
+
+  // Scaled view: the curve as if the kettle had been at `kref`: T' = t0 + (T - t0) / (kettle - t0) * (kref - t0),
+  // t0 = mean of the first 10 temperatures (the cold probe and dripper).
+  function t0Of(pts) {
+    let s = 0, n = 0;
+    for (const p of pts) if (p[1] != null) { s += p[1]; if (++n >= 10) break; }
+    return n ? s / n : null;
+  }
+  function scaleT(T, t0, kettle, kref) {
+    if (T == null || t0 == null || !(kettle > t0)) return T;
+    return t0 + (T - t0) / (kettle - t0) * (kref - t0);
+  }
+
+  // Reference curve: a finished brew kept for comparison.
+  function makeRef(brew, name) {
+    const t0 = t0Of(brew.samples);
+    return { name: name || '', kettle: brew.kettle, t0, v: brew.samples.map(p => p[1] == null ? null : Math.round(p[1] * 100) / 100), p: realChips(brew.pours, brew.samples.map(p => [p[0], p[1], BrewTrace.okWeight(p[2])])).chips.map(c => c.start) };
+  }
+  // reference temperature at brew time t; with kref, scaled with the reference's own kettle temperature
+  function refValue(ref, t, kref) {
+    const v = ref.v[Math.round(t * 10)];
+    if (v == null) return null;
+    return kref != null && ref.kettle ? scaleT(v, ref.t0, ref.kettle, kref) : v;
+  }
+
+  // ---- Transport 5: replay of a recorded brew (C2 CSV) ----
+  // Plays the recorded samples as live packets: 10 Hz of brew time, `speed` times faster. It uses the RECORDED events (pours,
+  // kettle); it does not detect pours again, the Brewer does that. At the end the state is 2 (paused) and 'kettle' is emitted.
+  class ReplayTransport extends Emitter {
+    constructor(brew, opt) {
+      super(); this.kind = 'replay'; this.b = brew; this.opt = opt || {}; this.speed = this.opt.speed || 1;
+      this.idx = -1; this.playing = false; this.done = false; this.timer = null; this.carry = 0; this.lastWall = 0;
+    }
+    async connect() {
+      this.emit('status', { connected: true, text: 'Replay' });
+      if (!this.opt.manual) this.play();
+    }
+    disconnect() { this.pause(); this.emit('status', { connected: false, text: 'Not connected' }); }
+    async send() { return JSON.stringify({ ack: 0 }); }   // commands do nothing in a replay
+    play() {
+      if (this.done) this.restart();
+      this.playing = true; this.lastWall = Date.now();
+      if (!this.opt.manual && !this.timer) this.timer = setInterval(() => { const n = Date.now(), dt = (n - this.lastWall) / 1000; this.lastWall = n; this.step(dt * this.speed); }, 100);
+    }
+    pause() { this.playing = false; clearInterval(this.timer); this.timer = null; }
+    setSpeed(x) { this.speed = x; }
+    restart() { this.idx = -1; this.done = false; this.carry = 0; this.emit('status', { connected: true, text: 'Replay' }); }
+    // advance by dt seconds of BREW time; every recorded sample on the way is emitted
+    step(dt) {
+      const S = this.b.samples; if (!S.length || this.done) return;
+      this.carry += dt;
+      let n = Math.floor(this.carry * 10 + 1e-9);
+      this.carry -= n / 10;
+      while (n-- > 0 && !this.done) {
+        this.idx++;
+        const p = S[this.idx], t = p[0], last = this.idx >= S.length - 1;
+        this.emit('live', {
+          temp: p[1], cj: null, weight: p[2], state: last ? 2 : 1, elapsedMs: Math.round(t * 1000),
+          pours: this.b.pours.filter(q => q[0] <= t).length, auto: true, pourOpen: this.b.pours.some(q => q[0] <= t && t < q[1]),
+          weightMode: this.b.hasWeight, scaleConnected: this.b.hasWeight, sim: true, fault: 0, scaleBat: null, rssi: null,
+        });
+        if (last) {
+          this.done = true; this.pause();
+          if (this.b.kettle != null) this.emit('kettle', { c: this.b.kettle });
+          this.emit('status', { connected: true, text: 'Replay done' });
+        }
+      }
+    }
+    progress() { const n = this.b.samples.length; return n ? Math.max(0, this.idx) / n : 0; }
+  }
+
   root.BU = {
+    parseBrewCsv, valueAt, pourChips, realChips, MIN_POUR_G, t0Of, scaleT, makeRef, refValue, ReplayTransport,
     BrewTrace,
     SCALE, BREWER, BAT_SVC, BAT_LEVEL, parseScalePacket, parseLive, buildLive, parseInfo, FrameJoin, buildCommand,
     DemoTransport, WsTransport, BleBrewerTransport, BleScaleTransport,

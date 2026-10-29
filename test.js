@@ -132,10 +132,77 @@ function fakeBt(services, name) {
   }
   vw = tc.view();
   assert.strictEqual(vw.brewView, true); assert.strictEqual(vw.pts.length, 400); assert.strictEqual(vw.x0, 0); assert.strictEqual(vw.x1, 210 > 59.9 ? 210 : 0);
-  assert.strictEqual(vw.pours.length, 1); assert.deepStrictEqual(vw.pours[0], [5, 15]); assert.strictEqual(vw.wtop, 350);
+  assert.strictEqual(vw.pours.length, 1); assert.deepStrictEqual(vw.pours[0], [5, 15, false]); assert.strictEqual(vw.wtop, 350);
   tc.push(L({ state: 0 }), 60); assert.strictEqual(tc.view().brewView, false);
   tc.push(L({ state: 1, elapsedMs: 0 }), 61); assert.strictEqual(tc.view().pts.length, 1);   // a new brew starts empty
   assert.strictEqual(BU.BrewTrace.weightTop([[0, 1, null]]), 0); assert.strictEqual(BU.BrewTrace.weightTop([[0, 1, 120]]), 300); assert.strictEqual(BU.BrewTrace.weightTop([[0, 1, 301]]), 350);
+
+  // C2 CSV: out of order event rows, a duplicated kettle row, a scale lift (-140 g), an old 3 column file
+  const synth = ['time_s,temp_c,event,weight_g', '0.0,,start', '0.0,,bloom'];
+  for (let k = 0; k <= 400; k++) {
+    const t = k / 10, w = t < 3 ? 0 : t < 13 ? (t - 3) * 5 : t < 32 ? 50 : t < 40 ? 50 + (t - 32) * 6 : 98;
+    const lift = t >= 20 && t < 22.6;
+    synth.push(t.toFixed(1) + ',' + (30 + t / 2).toFixed(2) + ',,' + (lift ? -140 : w).toFixed(1));
+    if (k === 132) synth.push('12.9,,stop 1');          // detected 0.3 s later than it happened, written after the sample
+    if (k === 322) synth.push('32.0,,pour 2 auto');
+    if (k === 400) synth.push('39.4,,stop 2');
+  }
+  synth.push('40.0,,kettle 92.0', '40.0,,kettle 92.0', '40.0,,end');
+  const sbrew = BU.parseBrewCsv(synth.join('\r\n') + '\r\n');
+  assert.strictEqual(sbrew.samples.length, 401); assert.strictEqual(sbrew.dupes, 1); assert.strictEqual(sbrew.kettle, 92);
+  assert.strictEqual(sbrew.duration, 40); assert.ok(sbrew.hasWeight);
+  assert.deepStrictEqual(sbrew.pours, [[0, 12.9], [32, 39.4]]);
+  const schips = BU.pourChips(sbrew.pours, sbrew.samples.map(p => [p[0], p[1], BU.BrewTrace.okWeight(p[2])]));
+  assert.deepStrictEqual(schips.map(c => c.label), ['B', '2']);
+  assert.ok(Math.abs(schips[0].g - 49.5) < 0.6 && Math.abs(schips[1].g - 44.4) < 0.6, JSON.stringify(schips));
+  assert.strictEqual(BU.BrewTrace.okWeight(-140.6), null); assert.strictEqual(BU.BrewTrace.okWeight(-0.6), -0.6);
+  const old3 = BU.parseBrewCsv('time_s,temp_c,event\n0.0,,start\n0.0,36.5,\n0.1,36.6,\n0.1,,end\n');
+  assert.strictEqual(old3.samples.length, 2); assert.strictEqual(old3.hasWeight, false); assert.strictEqual(old3.samples[0][2], null);
+  // scaling: reference from docs/brewer.md (kettle 99.5, t0 35.3, peak 86.7 -> 96 gives 83.9; 92 -> 80.7; 100 -> 87.1)
+  assert.ok(Math.abs(BU.scaleT(86.7, 35.3, 99.5, 96) - 83.9) < 0.06); assert.ok(Math.abs(BU.scaleT(86.7, 35.3, 99.5, 92) - 80.7) < 0.06);
+  assert.ok(Math.abs(BU.scaleT(86.7, 35.3, 99.5, 100) - 87.1) < 0.06); assert.strictEqual(BU.scaleT(50, 35, 30, 96), 50);   // kettle <= t0: unchanged
+  const ref = BU.makeRef(sbrew, 'x'); assert.strictEqual(ref.kettle, 92); assert.deepStrictEqual(ref.p, [0, 32]);
+  assert.strictEqual(BU.refValue(ref, 10, null), ref.v[100]); assert.ok(BU.refValue(ref, 10, 96) > ref.v[100]);
+
+  // small pours: an open pour is never small; a closed pour under 15 g is dropped and the rest are renumbered
+  const sp = [[0, 12, false], [30, 38, false], [50, 52, false], [70, 71, true]], spts = [[0, 20, 0], [12, 20, 50], [30, 20, 50], [38, 20, 97], [50, 20, 97], [52, 20, 101], [70, 20, 101], [71, 20, 103]];
+  const rcs = BU.realChips(sp, spts); assert.deepStrictEqual(rcs.chips.map(c => c.label), ['B', '2', '3']); assert.strictEqual(rcs.ignored, 1);
+  // Replay: every sample is emitted, speed changes only the pace, state 2 and the kettle at the end
+  const rp = new BU.ReplayTransport(sbrew, { manual: true }), re = [], rk = [];
+  rp.on('live', l => re.push(l)); rp.on('kettle', k => rk.push(k)); await rp.connect();
+  rp.step(1); assert.strictEqual(re.length, 10); assert.strictEqual(re[9].elapsedMs, 900);
+  rp.step(50);
+  assert.strictEqual(re.length, 401); assert.strictEqual(re[400].state, 2); assert.strictEqual(re[399].state, 1); assert.ok(rp.done);
+  assert.deepStrictEqual(rk, [{ c: 92 }]);
+  assert.deepStrictEqual([re[100].pourOpen, re[135].pourOpen, re[330].pourOpen, re[395].pourOpen, re[399].pourOpen], [true, false, true, false, false]);
+  assert.strictEqual(re[330].pours, 2); assert.strictEqual(re[50].pours, 1);
+  // a trace fed by the replay has the same pours and chips as the CSV
+  const rt = new BU.BrewTrace(); re.forEach((l, i) => rt.push(l, i / 10));
+  assert.strictEqual(rt.view().pours.length, 2); assert.ok(Math.abs(rt.view().pours[1][0] - 32) < 0.11);
+  // 0.1 s steps at 30x speed also give every sample once
+  const rq = new BU.ReplayTransport(sbrew, { manual: true }); let nq = 0; rq.on('live', () => nq++); await rq.connect();
+  for (let i = 0; i < 200; i++) rq.step(0.1 * 30 * 0.1); assert.strictEqual(nq, 401);
+  // Demo: stop keeps the brew (state 2), BrewKettle announces the kettle, Brew end returns to idle
+  const dd = new BU.DemoTransport({ manual: true }), de = []; dd.on('live', l => de.push(l)); dd.on('kettle', k => de.push(k)); await dd.connect();
+  await dd.send('Brew start'); dd.step(5); await dd.send('Brew stop'); dd.step(0.1); assert.strictEqual(de[de.length - 1].state, 2);
+  await dd.send('BrewKettle 92.5'); assert.deepStrictEqual(de[de.length - 1], { c: 92.5 }); await dd.send('Brew end'); dd.step(0.1); assert.strictEqual(de[de.length - 1].state, 0);
+
+  // The real brew b11.csv (the user's recording), only when the file is on this computer
+  const b11p = process.env.B11 || require('os').homedir() + '/Downloads/b11.csv';
+  if (fs.existsSync(b11p)) {
+    const b = BU.parseBrewCsv(fs.readFileSync(b11p, 'utf8')), ch = BU.pourChips(b.pours, b.samples.map(p => [p[0], p[1], BU.BrewTrace.okWeight(p[2])]));
+    assert.strictEqual(b.samples.length, 1241); assert.strictEqual(b.dupes, 1); assert.strictEqual(b.kettle, 92); assert.strictEqual(b.duration, 124.1);
+    assert.deepStrictEqual(b.pours, [[0, 13.2], [32, 38.7], [52.1, 60.2], [70.9, 79.1], [91.2, 98.9], [107.1, 108.8]]);
+    assert.deepStrictEqual(ch.map(c => +c.g.toFixed(1)), [54.1, 46.1, 49.5, 51.4, 54.6, 8.7]);
+    assert.deepStrictEqual(ch.map(c => c.small), [false, false, false, false, false, true]);   // the user poured 5 times: pour 6 (8.7 g) is not one
+    const rcb = BU.realChips(b.pours, b.samples.map(p => [p[0], p[1], BU.BrewTrace.okWeight(p[2])]));
+    assert.strictEqual(rcb.chips.length, 5); assert.strictEqual(rcb.ignored, 1); assert.deepStrictEqual(rcb.chips.map(c => c.label), ['B', '2', '3', '4', '5']);
+    assert.deepStrictEqual(BU.makeRef(b, 'b11').p, [0, 32, 52.1, 70.9, 91.2]);
+    assert.ok(Math.abs(BU.t0Of(b.samples) - 34.364) < 0.001);
+    assert.ok(Math.abs(BU.scaleT(84.58, BU.t0Of(b.samples), 92, 96) - 88.07) < 0.02);
+    const gl = b.samples.filter(p => BU.BrewTrace.okWeight(p[2]) === null); assert.strictEqual(gl.length, 27);   // 17.3 to 19.9 s: scale lifted
+    console.log('b11.csv checked');
+  }
 
   // 6. page wiring: the files that the page and the service worker name exist, no secrets or IPs are published
   const html = fs.readFileSync('index.html', 'utf8'), swText = fs.readFileSync('sw.js', 'utf8');

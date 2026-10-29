@@ -1,5 +1,5 @@
 // Offline cache. Bump CACHE when a file changes: the old cache is then deleted at activation.
-const CACHE = 'brewerui-v2';
+const CACHE = 'brewerui-v3';
 const FILES = ['./', 'index.html', 'core.js', 'manifest.webmanifest', 'icon.svg'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES)).then(() => self.skipWaiting())); });
 self.addEventListener('activate', e => {
