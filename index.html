@@ -44,6 +44,11 @@ h1{margin:0;font-size:20px;flex:1 1 auto;display:flex;align-items:center;gap:8px
 .card .lab{margin-bottom:8px}
 #dev{display:flex;gap:12px;flex-wrap:wrap}
 #dev .card{flex:1 1 220px;display:flex;justify-content:space-between;align-items:center}
+#chartcard{display:flex;flex-direction:column;gap:6px}
+#wrap{position:relative;height:clamp(220px,38vh,420px)}
+canvas{position:absolute;inset:0;width:100%;height:100%}
+#legend{display:flex;gap:16px;flex-wrap:wrap;font-size:14px;color:var(--mu)}
+#legend i{display:inline-block;width:22px;border-top:3px solid;vertical-align:middle;margin-right:6px}
 </style>
 </head>
 <body>
@@ -55,6 +60,7 @@ h1{margin:0;font-size:20px;flex:1 1 auto;display:flex;align-items:center;gap:8px
   <button id="cScale">Connect to scale</button>
   <button id="disc" hidden>Disconnect</button>
  </div>
+ <div id="ctl" class="pill" hidden style="height:auto;padding:8px;gap:8px;border-radius:18px;align-self:flex-start"><button id="bStart" class="p">Start brew</button><button id="bStop">Stop</button></div>
  <div id="banner" hidden></div>
  <div id="dev">
   <div class="card"><span><span class="lab">Brewer battery</span><br><span class="note" id="bBrewerNote">optional: shown when the Brewer reports it</span></span><span class="bat num" id="bBrewer">&ndash;</span></div>
@@ -66,7 +72,12 @@ h1{margin:0;font-size:20px;flex:1 1 auto;display:flex;align-items:center;gap:8px
   <div class="card"><div class="lab">Brew time</div><span class="num big" id="rE">0:00</span></div>
   <div class="card"><div class="lab">Pours</div><span class="num big" id="rP">0</span></div>
  </div>
- <p class="note">Skeleton. The brew chart, scaled view, reference curve and pour chips move over from the old page in the next steps.</p>
+ <div class="card" id="chartcard">
+  <div class="lab" id="ctitle">Last 60 s</div>
+  <div id="wrap"><canvas id="cv" role="img" aria-label="Temperature and weight chart"></canvas></div>
+  <div id="legend"><span><i style="border-color:var(--act)"></i>Temperature &deg;C</span><span><i style="border-color:var(--w);border-top-style:dashed"></i>Weight g</span></div>
+ </div>
+ <p class="note">Skeleton. The scaled view, reference curve and pour chips move over from the old page in the next steps.</p>
 </div>
 <script src="core.js"></script>
 <script>
@@ -74,12 +85,44 @@ h1{margin:0;font-size:20px;flex:1 1 auto;display:flex;align-items:center;gap:8px
 'use strict';
 const $=id=>document.getElementById(id), q=new URLSearchParams(location.search);
 let tr=null;
+const trace=new BU.BrewTrace(),Y0=20,Y1=100;
 
 function banner(msg,bad){const b=$('banner');b.hidden=!msg;b.textContent=msg||'';b.className=bad?'bad':''}
 function setBat(which,pct){
  const el=$(which==='brewer'?'bBrewer':'bScale');
  el.textContent=pct==null?'–':'~'+pct+' %';el.classList.toggle('low',pct!=null&&pct<15);
 }
+
+const mmss=t=>Math.floor(t/60)+':'+String(Math.floor(t%60)).padStart(2,'0');
+function draw(){
+ const C=$('cv'),X=C.getContext('2d'),W=C.clientWidth,H=C.clientHeight;if(!W||!H)return;
+ const dpr=window.devicePixelRatio||1;
+ if(C.width!==Math.round(W*dpr)||C.height!==Math.round(H*dpr)){C.width=Math.round(W*dpr);C.height=Math.round(H*dpr)}
+ const cs=getComputedStyle(document.documentElement),col=n=>cs.getPropertyValue(n).trim();
+ const v=trace.view(),hasW=v.wtop>0;
+ $('ctitle').textContent=v.brewView?'Brew':'Last 60 s';
+ X.setTransform(dpr,0,0,dpr,0,0);X.clearRect(0,0,W,H);
+ const L=32,T=10,PW=W-L-(hasW?38:8),PH=H-T-22,span=v.x1-v.x0||1;
+ const px=t=>L+(t-v.x0)/span*PW,py=q=>T+(1-(q-Y0)/(Y1-Y0))*PH;
+ X.font='11px system-ui,sans-serif';X.textBaseline='middle';X.fillStyle=col('--mu');X.textAlign='right';
+ for(let g=Y0;g<=Y1;g+=10){const y=py(g);X.strokeStyle=col('--line');X.lineWidth=1;X.beginPath();X.moveTo(L,Math.round(y)+.5);X.lineTo(L+PW,Math.round(y)+.5);X.stroke();X.fillText(g,L-6,y)}
+ if(hasW){X.textAlign='left';X.fillStyle=col('--w');for(let i=0;i<=4;i++){const g=v.wtop*i/4;X.fillText(String(Math.round(g)),L+PW+5,py(Y0+(g/v.wtop)*(Y1-Y0)))}}
+ X.fillStyle=col('--mu');X.textBaseline='alphabetic';
+ if(v.brewView){X.textAlign='center';for(let t=0;t<=v.x1;t+=60)X.fillText(mmss(t),Math.min(Math.max(px(t),L+12),L+PW-12),H-4)}
+ else{X.textAlign='left';X.fillText('\u221260 s',L,H-4);X.textAlign='right';X.fillText('now',L+PW,H-4)}
+ X.save();X.beginPath();X.rect(L,T,PW,PH);X.clip();
+ X.fillStyle='rgba(232,149,90,.14)';for(const p of v.pours)X.fillRect(px(p[0]),T,Math.max(1,px(p[1])-px(p[0])),PH);
+ const line=(sel,color,w,dash,y)=>{X.strokeStyle=color;X.lineWidth=w;X.setLineDash(dash);X.lineJoin=X.lineCap='round';X.beginPath();let on=false;
+  for(const p of v.pts){const q=p[sel];if(q==null){on=false;continue}const x=px(p[0]),yy=y(q);on?X.lineTo(x,yy):X.moveTo(x,yy);on=true}X.stroke();X.setLineDash([])};
+ if(hasW)line(2,col('--w'),2,[6,4],q=>py(Y0+(q/v.wtop)*(Y1-Y0)));
+ line(1,col('--act'),2.5,[],py);
+ const lp=v.pts[v.pts.length-1];
+ if(lp&&lp[1]!=null){X.fillStyle=col('--act');X.beginPath();X.arc(px(lp[0]),Math.min(T+PH,Math.max(T,py(lp[1]))),5,0,7);X.fill()}
+ X.restore();
+ if(v.brewView){X.textAlign='center';X.textBaseline='middle';X.font='600 11px system-ui,sans-serif';
+  v.pours.forEach((p,i)=>{const x=px(p[0]),s=i?String(i+1):'B',w=X.measureText(s).width+12;X.fillStyle=col('--raise');X.fillRect(x-w/2,T,w,16);X.fillStyle=col('--tx');X.fillText(s,x,T+8)})}
+}
+window.addEventListener('resize',draw);
 function fmtT(ms){const s=Math.floor(ms/1000);return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')}
 
 function attach(t){
@@ -89,11 +132,12 @@ function attach(t){
   $('rW').textContent=l.weight==null?'–':l.weight.toFixed(1);
   $('rE').textContent=fmtT(l.elapsedMs);$('rP').textContent=l.pours;
   if(l.scaleBat!=null)setBat('scale',l.scaleBat);
+  trace.push(l,performance.now()/1000);draw();
  });
  t.on('battery',b=>setBat(b.which,b.pct));
  t.on('status',s=>{
   $('stat').textContent=s.text;$('dot').className='dot'+(s.connected?' on':'');
-  $('disc').hidden=!s.connected;$('cBrewer').disabled=$('cScale').disabled=s.connected;
+  $('disc').hidden=!s.connected;$('ctl').hidden=!s.connected||tr.kind==='ble-scale';$('cBrewer').disabled=$('cScale').disabled=s.connected;
   if(!s.connected&&s.text==='Connection lost')banner('Bluetooth connection lost. Connect again.',true);
  });
 }
@@ -110,6 +154,8 @@ const hasBT=typeof navigator!=='undefined'&&!!navigator.bluetooth;
 function needBT(){if(!hasBT){banner('This browser has no Web Bluetooth. Use Chrome or Edge, or Bluefy on iOS.',true);return false}return true}
 $('cBrewer').onclick=()=>{if(needBT())go(new BU.BleBrewerTransport(navigator.bluetooth),'Brewer (draft)')};
 $('cScale').onclick=()=>{if(needBT())go(new BU.BleScaleTransport(navigator.bluetooth),'Scale only')};
+const send=c=>{if(tr)tr.send(c).catch(e=>banner('Command failed: '+(e&&e.message||e),true))};
+$('bStart').onclick=()=>send('Brew start');$('bStop').onclick=()=>send('Brew stop');
 $('disc').onclick=()=>{if(tr)tr.disconnect()};
 
 if(q.has('demo')){go(new BU.DemoTransport(),'Demo')}

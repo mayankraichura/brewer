@@ -122,11 +122,26 @@ function fakeBt(services, name) {
   assert.ok(Math.abs(lastLive.weight - 250) < 0.01); assert.strictEqual(lastLive.pours, 5); assert.ok(lastLive.temp > 60 && lastLive.temp < 100);
   assert.ok(ed.some(x => x.which === 'brewer') && ed.some(x => x.which === 'scale'));
 
+  // BrewTrace: live window, brew view, pour spans, weight axis
+  const tc = new BU.BrewTrace({ liveWin: 5 }), L = (o) => Object.assign({ temp: 25, weight: 0, state: 0, elapsedMs: 0, pours: 0, pourOpen: false }, o);
+  for (let i = 0; i < 100; i++) tc.push(L({ temp: 25 + i / 100 }), i / 10);   // 10 s idle at 10 Hz
+  let vw = tc.view();
+  assert.strictEqual(vw.brewView, false); assert.ok(vw.pts.length <= 52 && vw.pts.length >= 50); assert.strictEqual(vw.wtop, 0);
+  for (let i = 0; i < 400; i++) {   // brew: pour open 5 s to 15 s, weight up to 350 g
+    const t = i / 10; tc.push(L({ state: 1, elapsedMs: i * 100, temp: 80, weight: Math.min(350, t * 10), pourOpen: t >= 5 && t < 15 }), 10 + t);
+  }
+  vw = tc.view();
+  assert.strictEqual(vw.brewView, true); assert.strictEqual(vw.pts.length, 400); assert.strictEqual(vw.x0, 0); assert.strictEqual(vw.x1, 210 > 59.9 ? 210 : 0);
+  assert.strictEqual(vw.pours.length, 1); assert.deepStrictEqual(vw.pours[0], [5, 15]); assert.strictEqual(vw.wtop, 350);
+  tc.push(L({ state: 0 }), 60); assert.strictEqual(tc.view().brewView, false);
+  tc.push(L({ state: 1, elapsedMs: 0 }), 61); assert.strictEqual(tc.view().pts.length, 1);   // a new brew starts empty
+  assert.strictEqual(BU.BrewTrace.weightTop([[0, 1, null]]), 0); assert.strictEqual(BU.BrewTrace.weightTop([[0, 1, 120]]), 300); assert.strictEqual(BU.BrewTrace.weightTop([[0, 1, 301]]), 350);
+
   // 6. page wiring: the files that the page and the service worker name exist, no secrets or IPs are published
   const html = fs.readFileSync('index.html', 'utf8'), swText = fs.readFileSync('sw.js', 'utf8');
   for (const f of ['core.js', 'manifest.webmanifest', 'icon.svg', 'sw.js', 'index.html']) assert.ok(fs.existsSync(f), f);
   for (const f of ['core.js', 'manifest.webmanifest', 'icon.svg', 'index.html']) assert.ok(swText.includes("'" + f + "'"), 'sw caches ' + f);
-  for (const k of ['Connect to Brewer', 'Connect to scale', 'bBrewer', 'bScale', "q.has('demo')", 'serviceWorker']) assert.ok(html.includes(k), k);
+  for (const k of ['Connect to Brewer', 'Connect to scale', 'bBrewer', 'bScale', "q.has('demo')", 'serviceWorker', 'id="cv"', 'bStart']) assert.ok(html.includes(k), k);
   for (const f of ['index.html', 'core.js', 'sw.js', 'README.md']) {
     if (!fs.existsSync(f)) continue;
     const s = fs.readFileSync(f, 'utf8');

@@ -245,7 +245,51 @@
     }
   }
 
+  // ---- Chart data ----
+  // Collects the live packets. While a brew runs or is paused (state 1, 2) the whole brew is kept, time = brew time.
+  // When idle (state 0) the last `liveWin` seconds are kept, time = seconds since the page started.
+  // Pour spans come from the pourOpen flag. Same idea as the old page: brew view while bs != 0, live view otherwise.
+  class BrewTrace {
+    constructor(opt) {
+      opt = opt || {};
+      this.liveWin = opt.liveWin || 60; this.maxBrew = opt.maxBrew || 4800 + 600;   // 8 min at 10 Hz, a little extra
+      this.live = []; this.brew = []; this.pours = []; this.state = 0; this.last = null; this.clock = 0;
+    }
+    // l = a 'live' event; nowS = wall clock in seconds (only used for the live window)
+    push(l, nowS) {
+      this.last = l; this.clock = nowS;
+      if (l.state !== 0) {
+        if (this.state === 0) { this.brew = []; this.pours = []; }   // a new brew starts
+        const t = l.elapsedMs / 1000, open = this.pours.length && this.pours[this.pours.length - 1][1] == null;
+        if (l.pourOpen && !open) this.pours.push([t, null]);
+        else if (!l.pourOpen && open) this.pours[this.pours.length - 1][1] = t;
+        if (this.brew.length < this.maxBrew) this.brew.push([t, l.temp, l.weight]);
+      } else {
+        this.live.push([nowS, l.temp, l.weight]);
+        while (this.live.length && nowS - this.live[0][0] > this.liveWin) this.live.shift();
+      }
+      this.state = l.state;
+    }
+    // What the chart shows: points [t, temp, weight], x range, the weight axis top (0 = no weight), pour spans.
+    view() {
+      const brewView = this.state !== 0;
+      if (brewView) {
+        const el = this.last ? this.last.elapsedMs / 1000 : 0;
+        const pours = this.pours.map(p => [p[0], p[1] == null ? el : p[1]]);
+        return { brewView, pts: this.brew, x0: 0, x1: Math.max(210, el + 20), wtop: BrewTrace.weightTop(this.brew), pours };
+      }
+      return { brewView, pts: this.live, x0: this.clock - this.liveWin, x1: this.clock, wtop: 0, pours: [] };
+    }
+    // Weight axis top: at least 300 g, rounded up to 50 g; 0 when the brew has no weights.
+    static weightTop(pts) {
+      let m = -1e9, has = false;
+      for (const p of pts) if (p[2] != null) { has = true; if (p[2] > m) m = p[2]; }
+      return has ? Math.max(300, Math.ceil(m / 50) * 50) : 0;
+    }
+  }
+
   root.BU = {
+    BrewTrace,
     SCALE, BREWER, BAT_SVC, BAT_LEVEL, parseScalePacket, parseLive, buildLive, parseInfo, FrameJoin, buildCommand,
     DemoTransport, WsTransport, BleBrewerTransport, BleScaleTransport,
   };
